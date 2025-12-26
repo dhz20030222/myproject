@@ -1,61 +1,98 @@
 import os
+# 1. 魔法代码：强制使用国内镜像 (防断网)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import psycopg2
+from pgvector.psycopg2 import register_vector  # 👈 关键修正1：引入向量工具
 from dotenv import load_dotenv
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer # 1. 新增：因为要算向量
+from sentence_transformers import SentenceTransformer
 
-# 加载 .env
 load_dotenv()
 
-# 初始化 DeepSeek (和你原来一样)
+# 初始化 DeepSeek
 client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"), # 注意：确保 .env 里是这个名字
+    api_key=os.getenv("DEEPSEEK_API_KEY"), 
     base_url="https://api.deepseek.com"
 )
 
-# 2. 新增：加载那个 1.3G 的模型 (用来把问题变成数字)
-# 服务启动时会加载一次，为了能去数据库里搜索
-print("正在加载搜索模型...")
+print("正在加载搜索模型 (BGE)...")
 model = SentenceTransformer('BAAI/bge-large-zh-v1.5')
 
 def ask_deepseek(question_text):
-    print(f"收到问题: {question_text}")
+    print(f"\n📢 用户提问: {question_text}")
     
-    # --- 新增步骤 A: 去数据库找资料 ---
-    # A1. 把问题变成向量
-    question_vector = model.encode(question_text).tolist()
+    # --- 步骤 A: 搜索数据库 ---
     
-    # A2. 连数据库查最近的 3 条
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-    cur = conn.cursor()
-    # 这里的 <=> 是“距离最近”的意思
-    cur.execute("SELECT content FROM knowledge_base ORDER BY embedding <=> %s::vector LIMIT 3", (question_vector,))
-    results = cur.fetchall() # 拿到查询结果
-    cur.close()
-    conn.close()
+    # 关键修正2：加上搜索前缀，让匹配更准
+    query_instruction = "为这个句子生成表示以用于检索相关文章："
+    question_vector = model.encode(query_instruction + question_text).tolist()
     
-    # A3. 把查到的资料拼成字符串
-    db_context = ""
-    if results:
-        for row in results:
-            db_context += row[0] + "\n---\n" # 把每一段资料拼起来
-    else:
-        db_context = "数据库里没查到相关内容。"
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         
-    # --- 原有步骤 B: 问 AI (稍微改一下 prompt) ---
-    # 把查到的资料 (db_context) 塞给 AI
-    prompt = f"参考资料：\n{db_context}\n\n用户问题：{question_text}\n请根据参考资料回答用户问题。"
+        # 关键修正3：告诉连接器怎么处理向量
+        register_vector(conn)
+        
+        cur = conn.cursor()
+        
+        # 关键修正4：SQL语句加上 ::vector 强制转换
+        # 意思是：把传进来的数组(%s)当成向量(vector)去和数据库里的比较
+        sql = """
+            SELECT content, source 
+            FROM knowledge_base 
+            ORDER BY embedding <=> %s::vector 
+            LIMIT 3
+        """
+        cur.execute(sql, (question_vector,))
+        results = cur.fetchall()
+        
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ 数据库查询出错: {e}")
+        return "抱歉，数据库连接出了点问题，请检查后台日志。"
+    
+    # --- 步骤 B: 组装资料 ---
+    db_context = ""
+    print(f"👀 数据库检索结果: 找到了 {len(results)} 条资料")
+    
+    if results:
+        for i, row in enumerate(results):
+            content = row[0]
+            source = row[1]
+            # 打印出来给你看，确认有没有拿到“STL”那段
+            print(f"   📄 [资料{i+1}] {content[:20]}...") 
+            db_context += f"--- 资料 {i+1} ---\n{content}\n\n"
+    else:
+        db_context = "数据库里未找到相关信息。"
+
+    # --- 步骤 C: 问 DeepSeek ---
+    prompt = f"""
+    你是一个严谨的考研复试助手。
+    请根据下面的【参考资料】回答【用户问题】。
+    
+    ⚠️ 规则：
+    1. 答案必须基于参考资料。
+    2. 如果资料里明确提到了（比如“允许使用STL”），请直接告诉用户“允许”。
+    3. 如果资料里真没有，就说不知道。
+
+    【参考资料】：
+    {db_context}
+
+    【用户问题】：
+    {question_text}
+    """
 
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "你是一个考研助手。"},
-                {"role": "user", "content": prompt} # 这里发给 AI 的是“资料+问题”
+                {"role": "system", "content": "你是一个乐于助人的助手。"},
+                {"role": "user", "content": prompt}
             ],
             stream=False
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"报错啦: {str(e)}"
+        return f"DeepSeek 报错啦: {str(e)}"

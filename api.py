@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-import logic 
+import logic ,ingest
 from fastapi import FastAPI,UploadFile, File, HTTPException,APIRouter
 import shutil  # 👈 必须有这一行，用来保存文件
 import os      # 👈 必须有这一行，用来删除临时文件
@@ -30,20 +30,20 @@ def chat_endpoint(input_data: Question):
     return {"data": ai_answer}
 
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    # A. 确定临时文件路径 (防止文件名冲突，实际项目可能需要更复杂的文件名处理)
+async def upload_file(file: UploadFile = File(...)):###fastapi的语法  告诉fastapi 这个参数是一个文件  并且...是内容不能为空
+    # A. 确定临时文件路径   格式化字符串
     temp_path = f"temp_{file.filename}"
-    
     try:
-        # B. 把上传的文件流写入硬盘
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # B. 把上传的文件流写入硬盘 “逻辑层为什么不直接读内存里的数据？为什么要先存成临时文件再读？”
+        #1 若用户太多 内存爆     2 后面切片langchain需要的参数是文件路径
+        with open(temp_path, "wb") as buffer: # with 代码出了缩进块自动关文件
+            shutil.copyfileobj(file.file, buffer)# shutil每次只往内存读16KB
             
         print(f"✅ [接口层] 文件已暂存到: {temp_path}")
 
         # C. 调用逻辑层 (我们刚才写的那个空函数)
         # 注意：这里我们把“硬盘上的路径”和“原始文件名”传过去
-        result = logic.process_uploaded_file(temp_path, file.filename)
+        result = ingest.process_uploaded_file(temp_path, file.filename)
         
         return {"message": f"上传成功！逻辑层返回: {result}"}
         

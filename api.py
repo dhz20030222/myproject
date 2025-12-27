@@ -16,6 +16,7 @@ router = APIRouter()
 # 定义接收的数据格式
 class Question(BaseModel):
     text: str
+    filename: str | None = None
 
 # 定义接口：只负责接收请求，然后指挥 logic 去干活
 @router.post("/chat")

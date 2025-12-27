@@ -10,6 +10,8 @@ from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
+
+DB_URL = os.getenv("DATABASE_URL")
 # 初始化 DeepSeek
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"), 
@@ -18,35 +20,48 @@ client = OpenAI(
 
 print("正在加载搜索模型 (BGE)...")
 model = SentenceTransformer('BAAI/bge-large-zh-v1.5')
-
-def ask_deepseek(question_text):
-    print(f"\n📢 用户提问: {question_text}")
+def ask_deepseek(question_text, file_filter=None):
+    """
+    question_text: 用户的问题
+    file_filter: (可选) 用户指定的文件名。如果不传，则搜索整个知识库。
+    """
+    # 打印日志看看搜的是全库还是单文件
+    range_info = f"《{file_filter}》" if file_filter else "【全库】"
+    print(f"\n📢 [逻辑层] 用户提问: {question_text} (范围: {range_info})")
     
     # --- 步骤 A: 搜索数据库 ---
     
-    # 关键修正2：加上搜索前缀，让匹配更准
+    # 1. 向量化 (⚠️ 注意：这里用 get_model() 配合懒加载)
     query_instruction = "为这个句子生成表示以用于检索相关文章："
-    question_vector = model.encode(query_instruction + question_text).tolist()
+    question_vector = get_model().encode(query_instruction + question_text).tolist()
     
     try:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        
-        # 关键修正3：告诉连接器怎么处理向量
+        conn = psycopg2.connect(DB_URL)
         register_vector(conn)
-        
         cur = conn.cursor()
         
-        # 关键修正4：SQL语句加上 ::vector 强制转换
-        # 意思是：把传进来的数组(%s)当成向量(vector)去和数据库里的比较
-        sql = """
-            SELECT content, source 
-            FROM knowledge_base 
-            ORDER BY embedding <=> %s::vector 
-            LIMIT 3
-        """
-        cur.execute(sql, (question_vector,))
+        # 2. 动态构建 SQL (关键升级！支持按文件名过滤)
+        if file_filter:
+            # ✅ 情况1: 用户指定了文件，只在这个文件里搜
+            sql = """
+                SELECT content, source, page_number
+                FROM knowledge_base 
+                WHERE source = %s 
+                ORDER BY embedding <=> %s::vector 
+                LIMIT 3
+            """
+            cur.execute(sql, (file_filter, question_vector))
+        else:
+            # 🌐 情况2: 没选文件，全库搜索
+            sql = """
+                SELECT content, source, page_number
+                FROM knowledge_base 
+                ORDER BY embedding <=> %s::vector 
+                LIMIT 3
+            """
+            cur.execute(sql, (question_vector,))
+            
         results = cur.fetchall()
-        
         cur.close()
         conn.close()
     except Exception as e:
@@ -61,9 +76,11 @@ def ask_deepseek(question_text):
         for i, row in enumerate(results):
             content = row[0]
             source = row[1]
-            # 打印出来给你看，确认有没有拿到“STL”那段
-            print(f"   📄 [资料{i+1}] {content[:20]}...") 
-            db_context += f"--- 资料 {i+1} ---\n{content}\n\n"
+            page_num = row[2] # 多取一个页码，回答更专业
+            
+            # 打印摘要方便调试
+            print(f"   📄 [资料{i+1}] 来自《{source}》第{page_num}页") 
+            db_context += f"--- 资料 {i+1} (来源: {source} 第{page_num}页) ---\n{content}\n\n"
     else:
         db_context = "数据库里未找到相关信息。"
 
@@ -75,7 +92,7 @@ def ask_deepseek(question_text):
     ⚠️ 规则：
     1. 答案必须基于参考资料。
     2. 如果资料里明确提到了（比如“允许使用STL”），请直接告诉用户“允许”。
-    3. 如果资料里真没有，就说不知道。
+    3. 如果资料里真没有，就说不知道，不要瞎编。
 
     【参考资料】：
     {db_context}
@@ -97,12 +114,23 @@ def ask_deepseek(question_text):
     except Exception as e:
         return f"DeepSeek 报错啦: {str(e)}"
 
-def process_uploaded_file(temp_file_path, filename):
-    """
-    处理上传文件的空函数（占位符）
-    下一步我们再来实现具体的 PDF 读取和入库逻辑
-    """
-    print(f"👉 [逻辑层] 收到文件: {filename}, 临时路径: {temp_file_path}")
-    
-    # 暂时先返回一个假结果，证明流程通了
-    return "PDF 处理功能尚未实现，但接口调用成功！"
+# --- 新增功能: 获取文件列表 (给前端下拉框用) ---
+def get_file_list():
+    print("📂 [逻辑层] 正在查询文件列表...")
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        
+        # SQL 意思是：只选出不重复(DISTINCT)的 source 字段
+        cur.execute("SELECT DISTINCT source FROM knowledge_base;")
+        
+        # 把查询结果变成一个干净的列表，比如 ['math.pdf', 'rule.pdf']
+        files = [row[0] for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        print(f"   ✅ 查到了 {len(files)} 个文件")
+        return files
+    except Exception as e:
+        print(f"❌ 获取文件列表失败: {e}")
+        return []

@@ -57,3 +57,11 @@ async def upload_file(file: UploadFile = File(...)):###fastapi的语法  告诉f
         if os.path.exists(temp_path):
             os.remove(temp_path)
             print(f"🧹 [接口层] 临时文件已清理: {temp_path}")
+
+# --- 3. 获取文件列表接口 (新增) ---
+@router.get("/files")
+def get_files():
+    # 调用逻辑层去数据库查一下有哪些书
+    files = logic.get_file_list()
+    # 返回 JSON 格式给前端
+    return {"files": files}

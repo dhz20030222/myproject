@@ -96,3 +96,13 @@ def ask_deepseek(question_text):
         return response.choices[0].message.content
     except Exception as e:
         return f"DeepSeek 报错啦: {str(e)}"
+
+def process_uploaded_file(temp_file_path, filename):
+    """
+    处理上传文件的空函数（占位符）
+    下一步我们再来实现具体的 PDF 读取和入库逻辑
+    """
+    print(f"👉 [逻辑层] 收到文件: {filename}, 临时路径: {temp_file_path}")
+    
+    # 暂时先返回一个假结果，证明流程通了
+    return "PDF 处理功能尚未实现，但接口调用成功！"

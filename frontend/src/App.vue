@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, nextTick } from 'vue'
-import axios from 'axios'
+// 注意：我把 import axios 删掉了，以后不需要它了！
 
 // --- 1. 变量定义 ---
 const fileList = ref([])          // 文件列表
@@ -13,37 +13,42 @@ const chatWindow = ref(null)      // 聊天窗口的 DOM 引用
 const uploadStatus = ref("")      // 上传提示
 
 // --- 2. 配置后端地址 ---
-// 注意：Vue 跑在 5173，FastAPI 跑在 8000，必须写全路径
 const API_BASE = "http://127.0.0.1:8000"
 
-// --- 3. 生命周期: 页面加载时执行 ---
+// --- 3. 生命周期 ---
 onMounted(() => {
   refreshFiles()
 })
 
 // --- 4. 核心功能函数 ---
 
-// 获取文件列表
+// A. 获取文件列表 (改用 fetch)
 const refreshFiles = async () => {
   try {
-    const res = await axios.get(`${API_BASE}/files`)
-    fileList.value = res.data.files
+    const res = await fetch(`${API_BASE}/files`)
+    if (!res.ok) throw new Error("网络请求失败")
+    
+    const data = await res.json()
+    fileList.value = data.files // 更新列表
+    console.log("成功加载文件列表:", data.files)
   } catch (e) {
-    console.error("获取列表失败", e)
+    console.error("获取列表失败:", e)
+    // 可以在这里加个 alert 方便调试，发布时去掉
+    // alert("无法连接到后端，请检查 python main.py 是否在运行")
   }
 }
 
-// 选中文件
+// B. 选中文件
 const selectFile = (file) => {
   selectedFile.value = file
 }
 
-// 触发上传点击
+// C. 触发上传点击
 const triggerUpload = () => {
   fileInput.value.click()
 }
 
-// 处理文件上传
+// D. 处理文件上传 (改用 fetch)
 const handleFileUpload = async (event) => {
   const file = event.target.files[0]
   if (!file) return
@@ -53,47 +58,77 @@ const handleFileUpload = async (event) => {
   formData.append('file', file)
 
   try {
-    const res = await axios.post(`${API_BASE}/upload`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+    // fetch 上传不需要手动设置 Content-Type，它会自动识别
+    const res = await fetch(`${API_BASE}/upload`, {
+      method: 'POST',
+      body: formData
     })
-    alert(res.data.message) // 弹出后端返回的成功消息
-    uploadStatus.value = ""
-    refreshFiles() // 刷新列表
+    
+    const data = await res.json()
+    
+    if (res.ok) {
+      alert("✅ " + data.message)
+      uploadStatus.value = ""
+      refreshFiles() // 上传成功后，立刻刷新列表
+    } else {
+      throw new Error(data.detail || "上传失败")
+    }
   } catch (e) {
-    alert("上传失败: " + (e.response?.data?.detail || str(e)))
+    alert("❌ 上传出错: " + e.message)
     uploadStatus.value = "上传失败"
   }
 }
 
-// 发送消息
+// E. 发送消息 (流式版 - 保持 fetch 不变)
 const sendMessage = async () => {
   if (!inputMessage.value.trim()) return
 
-  // 1. 用户消息上屏
+  // 用户消息上屏
   const text = inputMessage.value
   chatHistory.value.push({ role: 'user', content: text })
-  inputMessage.value = ""
+  inputMessage.value = "" 
+  
+  // AI 消息占位
+  const aiMessageIndex = chatHistory.value.push({ role: 'ai', content: "" }) - 1
+  const aiMessage = chatHistory.value[aiMessageIndex]
+  
   isLoading.value = true
   scrollToBottom()
 
-  // 2. 发送请求
   try {
-    const res = await axios.post(`${API_BASE}/chat`, {
-      text: text,
-      filename: selectedFile.value // 告诉后端我在针对哪个文件提问
+    const response = await fetch(`${API_BASE}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: text,
+        filename: selectedFile.value
+      })
     })
-    
-    // 3. AI 消息上屏
-    chatHistory.value.push({ role: 'ai', content: res.data.data })
+
+    if (!response.ok) throw new Error("服务器连接失败")
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      
+      const chunk = decoder.decode(value, { stream: true })
+      aiMessage.content += chunk
+      scrollToBottom()
+    }
+
   } catch (e) {
-    chatHistory.value.push({ role: 'ai', content: "❌ 服务器连接失败" })
+    console.error(e)
+    aiMessage.content += "\n[❌ 哎呀，出错了]"
   } finally {
     isLoading.value = false
     scrollToBottom()
   }
 }
 
-// 滚动到底部
+// 辅助函数：滚动到底部
 const scrollToBottom = () => {
   nextTick(() => {
     if (chatWindow.value) {
@@ -102,6 +137,7 @@ const scrollToBottom = () => {
   })
 }
 
+// 辅助函数：清空
 const clearHistory = () => {
   chatHistory.value = []
 }
@@ -129,6 +165,7 @@ const clearHistory = () => {
         >
           🌏 全部范围 (默认)
         </div>
+
         <div 
           v-for="file in fileList" 
           :key="file" 
@@ -181,126 +218,30 @@ const clearHistory = () => {
 </template>
 
 <style scoped>
-/* 样式重置 */
-.app-container {
-  display: flex;
-  height: 100vh;
-  width: 100vw;
-  font-family: 'Segoe UI', sans-serif;
-  color: #333;
-}
-
-/* 左侧栏 */
-.sidebar {
-  width: 260px;
-  background-color: #2c3e50;
-  color: white;
-  display: flex;
-  flex-direction: column;
-  padding: 20px;
-}
-
-.upload-btn {
-  width: 100%;
-  padding: 10px;
-  background: transparent;
-  border: 1px dashed #aaa;
-  color: white;
-  cursor: pointer;
-  border-radius: 4px;
-  margin-top: 10px;
-}
+/* 保持样式不变，可以直接复用之前的 */
+.app-container { display: flex; height: 100vh; width: 100vw; font-family: 'Segoe UI', sans-serif; color: #333; }
+.sidebar { width: 260px; background-color: #2c3e50; color: white; display: flex; flex-direction: column; padding: 20px; }
+.upload-btn { width: 100%; padding: 10px; background: transparent; border: 1px dashed #aaa; color: white; cursor: pointer; border-radius: 4px; margin-top: 10px; }
 .upload-btn:hover { background: rgba(255,255,255,0.1); }
-
-.list-header {
-  margin-top: 20px;
-  font-size: 0.85rem;
-  color: #aaa;
-  margin-bottom: 10px;
-}
-
-.file-item {
-  padding: 10px;
-  cursor: pointer;
-  border-radius: 4px;
-  margin-bottom: 4px;
-  font-size: 0.9rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.list-header { margin-top: 20px; font-size: 0.85rem; color: #aaa; margin-bottom: 10px; }
+.file-item { padding: 10px; cursor: pointer; border-radius: 4px; margin-bottom: 4px; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-item:hover { background: rgba(255,255,255,0.1); }
 .file-item.active { background: #42b983; color: white; }
-
-/* 右侧聊天 */
-.main-chat {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: #f4f7f6;
-}
-
-.chat-header {
-  padding: 15px 20px;
-  background: white;
-  border-bottom: 1px solid #ddd;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
+.main-chat { flex: 1; display: flex; flex-direction: column; background: #f4f7f6; }
+.chat-header { padding: 15px 20px; background: white; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }
 .mode-tag { font-weight: bold; color: #2c3e50; font-size: 0.9rem; }
 .clear-btn { background: none; border: none; color: #999; cursor: pointer; }
-
-.chat-window {
-  flex: 1;
-  padding: 20px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 15px;
-}
-
-.empty-state {
-  text-align: center;
-  color: #aaa;
-  margin-top: 100px;
-}
-
+.chat-window { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+.empty-state { text-align: center; color: #aaa; margin-top: 100px; }
 .message-row { display: flex; gap: 10px; max-width: 80%; }
 .message-row.user { align-self: flex-end; flex-direction: row-reverse; }
 .message-row.ai { align-self: flex-start; }
-
 .avatar { font-size: 1.5rem; }
-.bubble {
-  padding: 12px 16px;
-  border-radius: 8px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
+.bubble { padding: 12px 16px; border-radius: 8px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
 .user .bubble { background: #42b983; color: white; }
 .ai .bubble { background: white; border: 1px solid #e0e0e0; }
-
-.input-area {
-  padding: 20px;
-  background: white;
-  display: flex;
-  gap: 10px;
-}
-input {
-  flex: 1;
-  padding: 12px;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  outline: none;
-}
-button {
-  padding: 0 25px;
-  background: #42b983;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-}
+.input-area { padding: 20px; background: white; display: flex; gap: 10px; }
+input { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 6px; outline: none; }
+button { padding: 0 25px; background: #42b983; color: white; border: none; border-radius: 6px; cursor: pointer; }
 button:disabled { background: #ccc; }
 </style>

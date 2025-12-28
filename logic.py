@@ -1,136 +1,100 @@
 import os
-# 1. 魔法代码：强制使用国内镜像 (防断网)
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
 import psycopg2
-from pgvector.psycopg2 import register_vector  # 👈 关键修正1：引入向量工具
+from pgvector.psycopg2 import register_vector
 from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
+# 1. 基础配置
 load_dotenv()
-
-
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 DB_URL = os.getenv("DATABASE_URL")
-# 初始化 DeepSeek
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"), 
-    base_url="https://api.deepseek.com"
-)
+DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-print("正在加载搜索模型 (BGE)...")
-model = SentenceTransformer('BAAI/bge-large-zh-v1.5')
+client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
+
+# 2. 模型懒加载 (这是给 upload_handler 借用的核心)
+model = None 
+
+def get_model():
+    """懒加载：保证全局只加载一次模型"""
+    global model
+    if model is None:
+        print("🚀 [系统] 正在加载 embedding 模型 (BGE)...")
+        model = SentenceTransformer('BAAI/bge-large-zh-v1.5')
+    return model
+
+# --- 功能 A: 获取文件列表 ---
+def get_file_list():
+    print("📂 [逻辑层] 正在查询文件列表...")
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT source FROM knowledge_base;")
+        files = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return files
+    except Exception as e:
+        print(f"❌ 获取文件列表失败: {e}")
+        return []
+
+# --- 功能 B: 流式问答 (Generator) ---
 def ask_deepseek(question_text, file_filter=None):
-    """
-    question_text: 用户的问题
-    file_filter: (可选) 用户指定的文件名。如果不传，则搜索整个知识库。
-    """
-    # 打印日志看看搜的是全库还是单文件
     range_info = f"《{file_filter}》" if file_filter else "【全库】"
     print(f"\n📢 [逻辑层] 用户提问: {question_text} (范围: {range_info})")
     
-    # --- 步骤 A: 搜索数据库 ---
-    
-    # 1. 向量化 (⚠️ 注意：这里用 get_model() 配合懒加载)
+    # 1. 搜索数据库
     query_instruction = "为这个句子生成表示以用于检索相关文章："
-    question_vector = get_model().encode(query_instruction + question_text).tolist()
-    
     try:
+        # 调用自己的 get_model()
+        question_vector = get_model().encode(query_instruction + question_text).tolist()
+        
         conn = psycopg2.connect(DB_URL)
         register_vector(conn)
         cur = conn.cursor()
         
-        # 2. 动态构建 SQL (关键升级！支持按文件名过滤)
         if file_filter:
-            # ✅ 情况1: 用户指定了文件，只在这个文件里搜
-            sql = """
-                SELECT content, source, page_number
-                FROM knowledge_base 
-                WHERE source = %s 
-                ORDER BY embedding <=> %s::vector 
-                LIMIT 3
-            """
+            sql = "SELECT content, source FROM knowledge_base WHERE source = %s ORDER BY embedding <=> %s::vector LIMIT 3"
             cur.execute(sql, (file_filter, question_vector))
         else:
-            # 🌐 情况2: 没选文件，全库搜索
-            sql = """
-                SELECT content, source, page_number
-                FROM knowledge_base 
-                ORDER BY embedding <=> %s::vector 
-                LIMIT 3
-            """
+            sql = "SELECT content, source FROM knowledge_base ORDER BY embedding <=> %s::vector LIMIT 3"
             cur.execute(sql, (question_vector,))
             
         results = cur.fetchall()
         cur.close()
         conn.close()
     except Exception as e:
-        print(f"❌ 数据库查询出错: {e}")
-        return "抱歉，数据库连接出了点问题，请检查后台日志。"
-    
-    # --- 步骤 B: 组装资料 ---
+        yield f"❌ 数据库报错: {e}"
+        return
+
+    # 2. 组装 Prompt
     db_context = ""
-    print(f"👀 数据库检索结果: 找到了 {len(results)} 条资料")
-    
     if results:
-        for i, row in enumerate(results):
-            content = row[0]
-            source = row[1]
-            page_num = row[2] # 多取一个页码，回答更专业
-            
-            # 打印摘要方便调试
-            print(f"   📄 [资料{i+1}] 来自《{source}》第{page_num}页") 
-            db_context += f"--- 资料 {i+1} (来源: {source} 第{page_num}页) ---\n{content}\n\n"
+        for row in results:
+            db_context += f"--- 来源: {row[1]} ---\n{row[0]}\n\n"
     else:
-        db_context = "数据库里未找到相关信息。"
+        db_context = "（数据库里未找到相关资料）"
 
-    # --- 步骤 C: 问 DeepSeek ---
-    prompt = f"""
-    你是一个严谨的考研复试助手。
-    请根据下面的【参考资料】回答【用户问题】。
-    
-    ⚠️ 规则：
-    1. 答案必须基于参考资料。
-    2. 如果资料里明确提到了（比如“允许使用STL”），请直接告诉用户“允许”。
-    3. 如果资料里真没有，就说不知道，不要瞎编。
+    prompt = f"请根据下面的【参考资料】回答用户问题。\n【参考资料】\n{db_context}\n【用户问题】\n{question_text}"
 
-    【参考资料】：
-    {db_context}
-
-    【用户问题】：
-    {question_text}
-    """
-
+    # 3. 流式请求 DeepSeek
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "你是一个乐于助人的助手。"},
+                {"role": "system", "content": "你是一个乐于助人的考研助手。"},
                 {"role": "user", "content": prompt}
             ],
-            stream=False
+            stream=True 
         )
-        return response.choices[0].message.content
+        
+        for chunk in response:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content 
     except Exception as e:
-        return f"DeepSeek 报错啦: {str(e)}"
+        yield f"DeepSeek API 报错: {e}"
 
-# --- 新增功能: 获取文件列表 (给前端下拉框用) ---
-def get_file_list():
-    print("📂 [逻辑层] 正在查询文件列表...")
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        
-        # SQL 意思是：只选出不重复(DISTINCT)的 source 字段
-        cur.execute("SELECT DISTINCT source FROM knowledge_base;")
-        
-        # 把查询结果变成一个干净的列表，比如 ['math.pdf', 'rule.pdf']
-        files = [row[0] for row in cur.fetchall()]
-        
-        cur.close()
-        conn.close()
-        print(f"   ✅ 查到了 {len(files)} 个文件")
-        return files
-    except Exception as e:
-        print(f"❌ 获取文件列表失败: {e}")
-        return []
+# 4. (如果你写了这行) 顶格写的函数调用：立刻执行！
+# get_model() 
